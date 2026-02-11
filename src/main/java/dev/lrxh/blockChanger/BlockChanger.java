@@ -14,27 +14,30 @@ import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.WorldLoader;
 import net.minecraft.server.dedicated.DedicatedServerProperties;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.progress.ChunkProgressListener;
 import net.minecraft.util.BitStorage;
 import net.minecraft.util.GsonHelper;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.*;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.BiomeManager;
 import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.dimension.LevelStem;
-import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.levelgen.WorldDimensions;
 import net.minecraft.world.level.levelgen.WorldOptions;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
@@ -64,8 +67,12 @@ public class BlockChanger {
 
   private static final int[][] SHIFT_CACHE = new int[16][];
   private static final long[][] MASK_CACHE = new long[16][];
-  private static final PalettedContainerFactory palettedContainerFactory = PalettedContainerFactory.create(MinecraftServer.getServer().registryAccess());
-  private static final PalettedContainer<BlockState> states = palettedContainerFactory.createForBlockStates();
+  private static final PalettedContainer<BlockState> states = new PalettedContainer<>(
+    Block.BLOCK_STATE_REGISTRY,
+    Blocks.AIR.defaultBlockState(),
+    PalettedContainer.Strategy.SECTION_STATES,
+    null
+  );
   private static JavaPlugin plugin;
   private static Field worldsField;
   private static Set<VirtualWorld> loadedWorlds;
@@ -232,11 +239,13 @@ public class BlockChanger {
   private static LevelChunkSection createEmptySection(final Level level) {
     final Registry<Biome> biomeRegistry = level.registryAccess().lookupOrThrow(Registries.BIOME);
     final Holder<Biome> defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
-    Strategy<Holder<Biome>> biomeStrategy = Strategy.createForBiomes(biomeRegistry.asHolderIdMap());
 
-    final PalettedContainer<Holder<Biome>> biomes = new PalettedContainerFactory(
-      null, null, null, biomeStrategy, defaultBiome, null, null
-    ).createForBiomes();
+    final PalettedContainer<Holder<Biome>> biomes = new PalettedContainer<>(
+      biomeRegistry.asHolderIdMap(),
+      defaultBiome,
+      PalettedContainer.Strategy.SECTION_BIOMES,
+      null
+    );
 
     LevelChunkSection section = new LevelChunkSection(states, biomes);
     section.recalcBlockCounts();
@@ -319,7 +328,7 @@ public class BlockChanger {
         final BlockState state = states[i];
         Integer id = paletteCache.get(state);
         if (id == null) {
-          id = palette.idFor(state, PaletteResize.noResizeExpected());
+          id = palette.idFor(state);
           paletteCache.put(state, id);
         }
         paletteIds[i] = id;
@@ -460,7 +469,7 @@ public class BlockChanger {
       final MinecraftServer server = MinecraftServer.getServer();
       final CraftServer craftServer = (CraftServer) Bukkit.getServer();
 
-      final WorldLoader.DataLoadContext context = craftServer.getServer().worldLoaderContext;
+      final WorldLoader.DataLoadContext context = craftServer.getServer().worldLoader;
 
       final LevelStorageSource storageSource = LevelStorageSource.createDefault(craftServer.getWorldContainer().toPath().resolve(creator.name()));
 
@@ -482,7 +491,7 @@ public class BlockChanger {
       final RegistryAccess.Frozen registryAccess = context.datapackDimensions();
       @SuppressWarnings("OptionalGetWithoutIsPresent") final Registry<LevelStem> contextLevelStemRegistry = registryAccess.lookup(Registries.LEVEL_STEM).get();
 
-      final WorldOptions worldOptions = new WorldOptions(creator.seed(), creator.generateStructures(), creator.bonusChest());
+      final WorldOptions worldOptions = new WorldOptions(creator.seed(), creator.generateStructures(), false);
       final DedicatedServerProperties.WorldDimensionData properties = new DedicatedServerProperties.WorldDimensionData(
         GsonHelper.parse(creator.generatorSettings().isEmpty() ? "{}" : creator.generatorSettings()),
         creator.type().name().toLowerCase(Locale.ROOT)
@@ -501,8 +510,9 @@ public class BlockChanger {
       final Lifecycle lifecycle = complete.lifecycle().add(context.datapackWorldgen().allRegistriesLifecycle());
       final PrimaryLevelData primaryLevelData = new PrimaryLevelData(levelSettings, worldOptions, complete.specialWorldProperty(), lifecycle);
       final LevelStem levelStem = WorldPresets.createNormalWorldDimensions(context.datapackWorldgen()).dimensions().get(LevelStem.OVERWORLD);
-      final ResourceKey<Level> dimensionKey = ResourceKey.create(Registries.DIMENSION, Identifier.fromNamespaceAndPath(creator.key().namespace(), creator.key().value()));
+      final ResourceKey<Level> dimensionKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath(creator.key().namespace(), creator.key().value()));
 
+      final ChunkProgressListener listener = craftServer.getServer().progressListenerFactory.create(primaryLevelData.getGameRules().getInt(GameRules.RULE_SPAWN_CHUNK_RADIUS));
       final ServerLevel serverLevel = new ServerLevel(
         server,
         EXECUTOR,
@@ -510,6 +520,7 @@ public class BlockChanger {
         primaryLevelData,
         dimensionKey,
         levelStem,
+        listener,
         primaryLevelData.isDebugWorld(),
         BiomeManager.obfuscateSeed(primaryLevelData.worldGenOptions().seed()),
         ImmutableList.of(),
@@ -525,8 +536,7 @@ public class BlockChanger {
 
       Bukkit.getScheduler().getMainThreadExecutor(plugin).execute(() -> {
         WorldBorder worldborder = serverLevel.getWorldBorder();
-        Optional<WorldBorder.Settings> wbSettings = primaryLevelData.getLegacyWorldBorderSettings();
-        wbSettings.ifPresent(worldborder::applySettings);
+        worldborder.applySettings(primaryLevelData.getWorldBorder());
         new WorldLoadEvent(serverLevel.getWorld()).callEvent();
       });
 
