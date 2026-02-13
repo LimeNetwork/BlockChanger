@@ -390,7 +390,7 @@ public class BlockChanger {
         final ChunkPos pos = new ChunkPos(chunkX, chunkZ);
 
         CompletableFuture<Chunk> chunkFuture = chunkCache.computeIfAbsent(pos,
-          k -> bukkitWorld.getChunkAtAsync(chunkX, chunkZ, false));
+          k -> bukkitWorld.getChunkAtAsync(chunkX, chunkZ, true));
 
         return chunkFuture.thenAcceptAsync(chunk -> {
           final ChunkAccess access = ((CraftChunk) chunk).getHandle(ChunkStatus.FULL);
